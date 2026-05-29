@@ -33,10 +33,11 @@ DEFAULT_STATE: dict = {
     "failure_types":         {"ik":0,"obstacle":0,"grasp":0,"detection":0,"other":0},
     "detected_count":        0,
     "skip_reasons":          {"immature":0,"occluded":0,"harvested":0,"other":0},
-    "pending_joint_command": None,
-    "pending_tcp_command":   None,
-    "last_updated":          None,
-    "gripper":               {"position":100.0,"state":"open","force":30.0},
+    "pending_joint_command":  None,
+    "pending_tcp_command":    None,
+    "last_updated":           None,
+    "gripper":                {"position":100.0,"state":"open","force":30.0},
+    "planned_duration_hours": 0,
 }
 
 def _load() -> dict:
@@ -215,8 +216,8 @@ body{background:var(--bg);color:var(--t1);font-family:var(--font);
 
 /* HEADER */
 .hdr{background:var(--surface);border-bottom:1px solid var(--border);
-  box-shadow:var(--sh-sm);padding:0 16px;height:44px;flex-shrink:0;
-  display:flex;align-items:center;justify-content:space-between;gap:10px;z-index:10}
+  box-shadow:var(--sh-sm);padding:0 12px;height:40px;flex-shrink:0;
+  display:flex;align-items:center;justify-content:space-between;gap:8px;z-index:10}
 .hd-brand{display:flex;align-items:center;gap:8px;flex-shrink:0}
 .hd-logo{width:26px;height:26px;border-radius:6px;
   background:linear-gradient(135deg,#c0392b,#e74c3c);
@@ -253,12 +254,12 @@ body{background:var(--bg);color:var(--t1);font-family:var(--font);
 
 /* MAIN */
 .main{flex:1;min-height:0;display:flex;flex-direction:column;
-  padding:8px 14px;gap:7px;overflow:hidden}
+  padding:5px 10px;gap:5px;overflow:hidden}
 
 /* STATS */
-.stats-row{display:grid;grid-template-columns:repeat(8,1fr);gap:6px;flex-shrink:0}
+.stats-row{display:grid;grid-template-columns:repeat(8,1fr);gap:4px;flex-shrink:0}
 .sc{background:var(--card);border:1px solid var(--border);border-radius:var(--r);
-  padding:7px 10px 6px;position:relative;overflow:hidden;box-shadow:var(--sh);
+  padding:5px 8px 4px;position:relative;overflow:hidden;box-shadow:var(--sh);
   transition:box-shadow .2s,transform .15s}
 .sc:hover{box-shadow:0 4px 6px rgba(0,0,0,.07);transform:translateY(-1px)}
 .sc::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;
@@ -267,16 +268,35 @@ body{background:var(--bg);color:var(--t1);font-family:var(--font);
 .sy::before{background:var(--yellow)}.sr::before{background:var(--red)}
 .sc2::before{background:var(--cyan)}.sp::before{background:var(--purple)}
 .ss::before{background:var(--slate)}
-.sc-lbl{font-size:12px;font-weight:700;color:var(--t2);text-transform:uppercase;
-  letter-spacing:.3px;margin-bottom:4px}
-.sc-val{font-family:var(--mono);font-size:22px;font-weight:800;line-height:1;
+.sc-lbl{font-size:10px;font-weight:700;color:var(--t2);text-transform:uppercase;
+  letter-spacing:.3px;margin-bottom:2px}
+.sc-val{font-family:var(--mono);font-size:18px;font-weight:800;line-height:1;
   font-variant-numeric:tabular-nums;transition:color .3s}
-.sc-unit{font-size:11px;font-weight:600;margin-left:2px;font-family:var(--font);color:var(--t3)}
+.sc-unit{font-size:10px;font-weight:600;margin-left:2px;font-family:var(--font);color:var(--t3)}
 .sg .sc-val{color:var(--green)}.sb .sc-val{color:var(--blue)}
 .sy .sc-val{color:var(--yellow)}.sc2 .sc-val{color:var(--cyan)}
 .sp .sc-val{color:var(--purple)}.ss .sc-val{color:var(--slate)}
-.sc-bar{margin-top:6px;height:2px;border-radius:2px;background:var(--border);overflow:hidden}
+.sc-bar{margin-top:3px;height:2px;border-radius:2px;background:var(--border);overflow:hidden}
 .sc-bar-f{height:100%;border-radius:2px;transition:width .6s ease}
+
+/* SESSION INFO BAR */
+.sinfo-bar{display:flex;align-items:stretch;background:var(--card);
+  border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--sh);
+  flex-shrink:0;overflow:hidden;height:30px}
+.sinfo-cell{display:flex;align-items:center;gap:6px;padding:0 12px;
+  border-right:1px solid var(--border);flex-shrink:0}
+.sinfo-cell:last-child{border-right:none}
+.sinfo-lbl{font-size:8px;font-weight:700;color:var(--t3);text-transform:uppercase;
+  letter-spacing:.5px;white-space:nowrap}
+.sinfo-val{font-family:var(--mono);font-size:12px;font-weight:700;color:var(--t1);
+  white-space:nowrap;transition:color .4s}
+.sinfo-inp{width:44px;padding:1px 4px;border:1px solid var(--border);border-radius:4px;
+  font-family:var(--mono);font-size:11px;background:var(--bg);outline:none;text-align:right;color:var(--t1)}
+.sinfo-inp:focus{border-color:var(--blue);background:var(--blue-bg)}
+.sinfo-btn{padding:2px 8px;border-radius:4px;border:none;background:var(--blue);
+  color:#fff;font-size:9px;font-weight:700;cursor:pointer}
+.sinfo-btn:hover{background:var(--blue-tx)}
+.sinfo-unit{font-size:9px;color:var(--t3);white-space:nowrap}
 
 /* META ROW */
 .meta-row{display:grid;grid-template-columns:3fr 2fr 2fr;gap:6px;flex-shrink:0}
@@ -308,8 +328,8 @@ body{background:var(--bg);color:var(--t1);font-family:var(--font);
 
 /* BOTTOM ROW */
 .bot{flex:1;min-height:0;display:grid;
-  grid-template-columns:200px 320px 1fr 250px;
-  gap:6px;overflow:hidden}
+  grid-template-columns:185px 295px 1fr 190px;
+  gap:5px;overflow:hidden}
 
 /* GRAPH BANNER (4열 상단) */
 .bg-panel{grid-column:1/5;grid-row:1;
@@ -500,7 +520,7 @@ body{background:var(--bg);color:var(--t1);font-family:var(--font);
 .cam-body{flex:1;min-height:0;position:relative;background:#0a0f1e;
   display:flex;align-items:center;justify-content:center;
   overflow:hidden;cursor:pointer}
-.cam-img{width:100%;height:100%;object-fit:cover;display:block}
+.cam-img{width:100%;height:100%;object-fit:contain;display:block}
 .cam-live{position:absolute;top:7px;right:7px;display:flex;align-items:center;gap:4px;
   background:rgba(220,38,38,.88);border-radius:3px;padding:2px 6px;
   font-size:9px;font-weight:800;letter-spacing:1.4px;color:#fff;
@@ -680,6 +700,28 @@ body{background:var(--bg);color:var(--t1);font-family:var(--font);
       <div class="sc-lbl" style="color:var(--t3)">감지 딸기</div>
       <div class="sc-val" id="v-det" style="color:var(--cyan)">0<span class="sc-unit">개</span></div>
       <div style="font-size:9px;color:var(--t3);margin-top:2px" id="v-det-sub">미수확 —</div>
+    </div>
+  </div>
+
+  <!-- 세션 정보 바 -->
+  <div class="sinfo-bar">
+    <div class="sinfo-cell">
+      <span class="sinfo-lbl">세션 시작</span>
+      <span class="sinfo-val" id="si-start">—</span>
+    </div>
+    <div class="sinfo-cell">
+      <span class="sinfo-lbl">예약 운영</span>
+      <input class="sinfo-inp" type="number" id="si-dur-inp" min="0.1" max="24" step="0.5" value="" placeholder="—">
+      <span class="sinfo-unit">시간</span>
+      <button class="sinfo-btn" onclick="setPlannedDuration()">설정</button>
+    </div>
+    <div class="sinfo-cell">
+      <span class="sinfo-lbl">종료 예정</span>
+      <span class="sinfo-val" id="si-end" style="color:var(--t3)">—</span>
+    </div>
+    <div class="sinfo-cell" style="flex:1">
+      <span class="sinfo-lbl">남은 시간</span>
+      <span class="sinfo-val" id="si-remain" style="color:var(--t3)">—</span>
     </div>
   </div>
 
@@ -979,6 +1021,23 @@ setInterval(()=>{
   ce.textContent=s;ce.style.color='var(--yellow)';te.textContent=s;
 },200);
 
+/* 남은 시간 카운트다운 */
+let _siSessionStart=null, _siPlannedHours=0;
+setInterval(()=>{
+  const remEl=document.getElementById('si-remain');
+  if(!remEl)return;
+  if(!_siSessionStart||!_siPlannedHours){remEl.textContent='—';remEl.style.color='var(--t3)';return;}
+  const endMs=_siSessionStart.getTime()+_siPlannedHours*3600000;
+  const remMs=endMs-Date.now();
+  if(remMs<=0){remEl.textContent='종료';remEl.style.color='var(--t3)';return;}
+  const rs=Math.floor(remMs/1000);
+  const hh=Math.floor(rs/3600),mm=Math.floor((rs%3600)/60),ss=rs%60;
+  remEl.textContent=hh>0
+    ?`${hh}:${String(mm).padStart(2,'0')}:${String(ss).padStart(2,'0')}`
+    :`${String(mm).padStart(2,'0')}:${String(ss).padStart(2,'0')}`;
+  remEl.style.color=remMs<1800000?'var(--red)':remMs<3600000?'var(--yellow)':'var(--green)';
+},1000);
+
 /* 데미지 플래시 */
 function triggerDmgFlash(){
   const el=document.getElementById('dmg-flash');
@@ -1050,6 +1109,15 @@ function checkSnapshots(s){
   if(succ>prevSuccSnap){captureSnapshot('success');prevSuccSnap=succ;}
   else if(att>prevAttSnap&&succ===prevSuccSnap){captureSnapshot('fail');}
   prevAttSnap=att;
+}
+
+/* 예약 운영 시간 설정 */
+async function setPlannedDuration(){
+  const h=parseFloat(document.getElementById('si-dur-inp').value);
+  if(!h||h<=0)return;
+  await fetch('/api/set-planned-duration',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({hours:h})}).catch(()=>{});
 }
 
 /* 목표 설정 */
@@ -1301,6 +1369,24 @@ function render(s){
     const st=new Date(s.session_start);
     document.getElementById('session-info').textContent=
       st.toLocaleTimeString('ko-KR',{hour12:false})+' 시작 / '+fmt((Date.now()-st)/1000)+' 경과';
+    _siSessionStart=st;
+    document.getElementById('si-start').textContent=st.toLocaleTimeString('ko-KR',{hour12:false});
+  } else {
+    _siSessionStart=null;
+    document.getElementById('si-start').textContent='—';
+  }
+  _siPlannedHours=s.planned_duration_hours||0;
+  if(_siPlannedHours>0){
+    const inp=document.getElementById('si-dur-inp');
+    if(inp&&inp!==document.activeElement)inp.value=_siPlannedHours;
+    if(_siSessionStart){
+      const endTime=new Date(_siSessionStart.getTime()+_siPlannedHours*3600000);
+      document.getElementById('si-end').textContent=endTime.toLocaleTimeString('ko-KR',{hour12:false});
+      document.getElementById('si-end').style.color='var(--t1)';
+    }
+  } else {
+    document.getElementById('si-end').textContent='—';
+    document.getElementById('si-end').style.color='var(--t3)';
   }
 
   document.getElementById('v-harvest').innerHTML=(s.success_count||0)+'<span class="sc-unit">개</span>';
@@ -1327,9 +1413,9 @@ function render(s){
   /* 수확 속도 */
   const spE=document.getElementById('v-speed'),spU=document.getElementById('v-speed-u');
   if(s.session_start&&s.success_count>0){
-    const h=(Date.now()-new Date(s.session_start))/3600000;
-    if(h>0.001){spE.innerHTML=(s.success_count/h).toFixed(1)+'<span class="sc-unit">개</span>';
-      spE.style.color='var(--purple)';spU.textContent='/ 시간';}
+    const sec=(Date.now()-new Date(s.session_start))/1000;
+    spE.innerHTML=(sec/s.success_count).toFixed(1)+'<span class="sc-unit">초</span>';
+    spE.style.color='var(--purple)';spU.textContent='/ 개';
   }else{spE.textContent='—';spE.style.color='var(--t3)';spU.textContent='';}
 
   /* 손상률 */
@@ -1550,6 +1636,12 @@ def make_app(demo=False, camera_id=0, camera_id_1=-1, no_camera=False):
     async def set_target(request: Request):
         b = await request.json()
         s = _load(); s["target_count"] = max(1, int(b.get("target",15)))
+        _save(s); return JSONResponse({"ok": True})
+
+    @app.post("/api/set-planned-duration")
+    async def set_planned_duration(request: Request):
+        b = await request.json()
+        s = _load(); s["planned_duration_hours"] = max(0.0, float(b.get("hours", 0)))
         _save(s); return JSONResponse({"ok": True})
 
     @app.post("/api/teleop")
