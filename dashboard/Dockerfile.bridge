@@ -1,0 +1,22 @@
+FROM ros:humble-ros-base
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3-pip \
+      python3-opencv \
+      libusb-1.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir pyrealsense2 ultralytics
+
+WORKDIR /app
+COPY ros2_bridge.py .
+
+RUN mkdir -p /data
+ENV HARVEST_STATE_FILE=/data/harvest_state.json
+ENV MJPEG_PORT=8766
+ENV PYTHONUNBUFFERED=1
+
+CMD ["/bin/bash", "-c", \
+    "source /opt/ros/humble/setup.bash && \
+     source /doosan_ws/install/setup.bash 2>/dev/null || true && \
+     python3 ros2_bridge.py"]

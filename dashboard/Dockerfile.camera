@@ -1,0 +1,18 @@
+FROM ros:humble
+
+# realsense2_camera 설치
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ros-humble-realsense2-camera \
+      ros-humble-realsense2-description \
+      libusb-1.0-0 \
+      libudev-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY camera_startup.sh .
+RUN chmod +x camera_startup.sh
+
+ENV PYTHONUNBUFFERED=1
+
+CMD ["/app/camera_startup.sh"]

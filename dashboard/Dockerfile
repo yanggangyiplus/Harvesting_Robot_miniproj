@@ -20,4 +20,4 @@ ENV HARVEST_STATE_FILE=/data/harvest_state.json
 
 EXPOSE 8765
 
-CMD ["python3", "harvest_dashboard.py", "--host", "0.0.0.0", "--port", "8765"]
+CMD ["sh", "-c", "python3 harvest_dashboard.py --host 0.0.0.0 --port 8765 --camera-url-0 \"${CAMERA_URL_0:-http://localhost:8766/cam0}\" --camera-url-1 \"${CAMERA_URL_1:-http://localhost:8766/cam1}\""]

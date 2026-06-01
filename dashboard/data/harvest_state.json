@@ -1,0 +1,59 @@
+{
+  "session_start": null,
+  "total_attempts": 0,
+  "success_count": 0,
+  "damage_count": 0,
+  "grasp_times": [],
+  "current_harvest_start": null,
+  "messages": [],
+  "status": "idle",
+  "robot_ready": true,
+  "robot_error": "",
+  "joint_angles": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "tcp_pose": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "target_count": 15,
+  "attempt_history": [],
+  "failure_types": {
+    "ik": 0,
+    "obstacle": 0,
+    "grasp": 0,
+    "detection": 0,
+    "other": 0
+  },
+  "detected_count": 0,
+  "skip_reasons": {
+    "immature": 0,
+    "occluded": 0,
+    "harvested": 0,
+    "other": 0
+  },
+  "pending_joint_command": null,
+  "pending_tcp_command": null,
+  "last_updated": "2026-06-01T02:51:12.035423",
+  "gripper": {
+    "position": 100.0,
+    "raw_pos": 0,
+    "state": "open",
+    "force": 30.0
+  },
+  "planned_duration_hours": 0,
+  "pending_teleop_command": {
+    "command": "stop",
+    "speed": 0.2,
+    "sent_at": "2026-06-01T02:48:43.024626"
+  }
+}

@@ -1,0 +1,17 @@
+FROM ros:humble-ros-base
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3-pip \
+      ros-humble-realsense2-camera \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir fastapi "uvicorn[standard]" numpy
+
+ENV WS_DIR=/vla_ws
+ENV PYTHONUNBUFFERED=1
+
+CMD ["/bin/bash", "-c", "\
+    source /opt/ros/humble/setup.bash && \
+    source /home/user/robot_workspace/doosan_ws/install/setup.bash 2>/dev/null || true && \
+    source /vla_ws/install/setup.bash 2>/dev/null || true && \
+    python3 /vla_ws/src/teleop_api_server.py"]

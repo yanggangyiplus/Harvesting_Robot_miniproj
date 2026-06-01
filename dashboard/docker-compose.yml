@@ -1,4 +1,93 @@
 services:
+
+  # ── ROS2 카메라 노드: RealSense 카메라 자동 시작 ────────────────────────────────
+  harvest-camera:
+    build:
+      context: .
+      dockerfile: Dockerfile.camera
+    container_name: harvest-camera
+    network_mode: "host"
+    ipc: "host"
+    pid: "host"
+    privileged: true
+    volumes:
+      - /dev:/dev
+      - /dev/bus/usb:/dev/bus/usb
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+      - PYTHONUNBUFFERED=1
+      - FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+    restart: unless-stopped
+
+  # ── 텔레오퍼레이션 API: 로봇 제어 + bag 녹화 관리 ────────────────────────────
+  teleop-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.teleop
+    container_name: harvest-teleop-api
+    network_mode: "host"
+    # ROS2(FastDDS)는 같은 호스트 내 대용량 데이터를 공유 메모리(SHM)로 전송하므로
+    # 호스트와 IPC 네임스페이스를 공유해야 토픽 데이터를 받을 수 있다.
+    ipc: "host"
+    pid: "host"
+    privileged: true
+    volumes:
+      - /opt/ros/humble:/opt/ros/humble:ro
+      # install/ 안 .py 파일이 build/ 경로를 심볼릭 링크로 참조하므로 둘 다 마운트
+      - /home/user/robot_workspace/doosan_ws/install:/home/user/robot_workspace/doosan_ws/install:ro
+      - /home/user/robot_workspace/doosan_ws/build:/home/user/robot_workspace/doosan_ws/build:ro
+      - /home/user/robot_workspace/vla_ws:/vla_ws
+      # realsense2_camera 노드가 /dev/video* 장치에 접근하기 위해 필요
+      - /dev:/dev
+      # harvest_state.json (ros2_bridge가 쓰고 teleop_api가 읽음)
+      - ./data:/data
+    environment:
+      - WS_DIR=/vla_ws
+      - RAW_DIR=/vla_ws/data/raw/final_project/vla_dataset_v0.3.0
+      - HARVEST_STATE_FILE=/data/harvest_state.json
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+      - PYTHONUNBUFFERED=1
+      # FastDDS 공유메모리(SHM) 전송은 컨테이너-호스트 경계에서 데이터가 전달되지 않음.
+      # UDP 전송으로 강제해야 호스트의 카메라/로봇 토픽을 받을 수 있다.
+      - FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+    restart: unless-stopped
+
+  # ── ROS2 브리지: 상태파일 + MJPEG 서버 + USB 폴백 ────────────────────────────
+  ros2-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile.bridge
+    container_name: harvest-ros2-bridge
+    network_mode: "host"
+    ipc: "host"
+    pid: "host"
+    privileged: true
+    volumes:
+      - ./data:/data
+      - /opt/ros/humble:/opt/ros/humble:ro
+      - /home/user/robot_workspace/doosan_ws/install:/doosan_ws/install:ro
+      - /dev/bus/usb:/dev/bus/usb
+      - /home/user/robot_workspace/vla_ws/models:/models:ro
+    environment:
+      - HARVEST_STATE_FILE=/data/harvest_state.json
+      - MJPEG_PORT=8766
+      - CAM0_TOPIC=/camera/camera/color/image_raw
+      - CAM1_TOPIC=/camera2/camera2/color/image_raw
+      - REALSENSE_SERIAL_0=215122254786
+      - REALSENSE_SERIAL_1=342622303457
+      - YOLO_MODEL=/models/strawberry_yolo26m_unified/weights/last.pt
+      - YOLO_CONF=0.3
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+      - PYTHONUNBUFFERED=1
+      # 카메라는 harvest-camera 컨테이너에서 실행하므로 USB 직접 접근 비활성화
+      - USB_FALLBACK=false
+      # FastDDS SHM은 컨테이너-호스트 경계에서 전달 안 됨 → UDP 강제
+      - FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+    restart: unless-stopped
+    depends_on:
+      - harvest-camera
+
+  # ── 웹 대시보드 ───────────────────────────────────────────────────────────────
   harvest-dashboard:
     build:
       context: .
@@ -7,14 +96,12 @@ services:
     network_mode: "host"
     environment:
       - HARVEST_STATE_FILE=/data/harvest_state.json
-      - CAMERA_ID=0       # 슬롯0: /dev/video0  (카메라 A)
-      - CAMERA_ID_1=1     # 슬롯1: /dev/video1  (카메라 B — 같은 기기 메타데이터 노드)
-      # RealSense 연결 시: CAMERA_ID=6, CAMERA_ID_1=0
+      - CAMERA_URL_0=http://localhost:8766/cam0
+      - CAMERA_URL_1=http://localhost:8766/cam1
+      - PYTHONUNBUFFERED=1
     volumes:
       - ./data:/data
-    devices:
-      - /dev/video0:/dev/video0
-      - /dev/video1:/dev/video1
-      - /dev/bus/usb:/dev/bus/usb
-    privileged: true
     restart: unless-stopped
+    depends_on:
+      - ros2-bridge
+      - teleop-api

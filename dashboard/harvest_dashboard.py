@@ -26,6 +26,8 @@ DEFAULT_STATE: dict = {
     "current_harvest_start": None,
     "messages":              [],
     "status":                "idle",
+    "robot_ready":           False,  # teleop_api에서 주기적으로 업데이트됨
+    "robot_error":           "",     # 로봇 연결 오류 메시지
     "joint_angles":          [0.0]*6,
     "tcp_pose":              [0.0]*6,
     "target_count":          15,
@@ -53,8 +55,11 @@ def _load() -> dict:
 
 def _save(s: dict) -> None:
     s["last_updated"] = datetime.now().isoformat()
+    # DEFAULT_STATE의 모든 키를 포함하도록 병합
+    out = DEFAULT_STATE.copy()
+    out.update(s)
     tmp = STATE_FILE.with_suffix('.tmp')
-    tmp.write_text(json.dumps(s, ensure_ascii=False, indent=2))
+    tmp.write_text(json.dumps(out, ensure_ascii=False, indent=2))
     os.replace(tmp, STATE_FILE)
 
 def _push_msg(s: dict, text: str, level: str = "info") -> None:
@@ -78,36 +83,78 @@ _cam_infos    = [{"source": "none", "label": "딸기 인식"},
 _cam_fps_v    = [0.0, 0.0]
 _cam_fps_lock = threading.Lock()
 
-def _camera_worker(camera_id: int = 0, slot: int = 0) -> None:
+def _camera_worker(camera_id: int = 0, slot: int = 0, serial: str = '',
+                    url: str = '') -> None:
+    """카메라 프레임 수집. url이 있으면 MJPEG URL에서 읽고, 없으면 USB 직접 접근."""
     try: import cv2
     except ImportError: print(f"[Camera{slot}] opencv not installed"); return
-    label  = _cam_infos[slot]["label"]
-    enc    = [cv2.IMWRITE_JPEG_QUALITY, 75]
+    label = _cam_infos[slot]["label"]
+    enc   = [cv2.IMWRITE_JPEG_QUALITY, 75]
+
+    # ── URL 소스 (ros2_bridge MJPEG 스트림) ──────────────────────────────────
+    # cv2.VideoCapture는 MJPEG URL에서 FATAL 크래시 발생 → urllib 직접 파싱
+    if url:
+        import urllib.request
+        import numpy as np
+        print(f"[Camera{slot}] URL 소스 사용: {url}")
+        _cam_infos[slot]["source"] = f"bridge:{url}"
+        fc, ft = 0, time.time()
+        while True:
+            try:
+                req = urllib.request.urlopen(url, timeout=10)
+                buf = b''
+                while True:
+                    chunk = req.read(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    # JPEG 프레임 추출 (SOI=0xFFD8, EOI=0xFFD9)
+                    while True:
+                        a = buf.find(b'\xff\xd8')
+                        b = buf.find(b'\xff\xd9', a + 2) if a != -1 else -1
+                        if a == -1 or b == -1:
+                            break
+                        jpg = buf[a:b + 2]
+                        buf = buf[b + 2:]
+                        arr = np.frombuffer(jpg, dtype=np.uint8)
+                        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                        if frame is not None:
+                            _, out = cv2.imencode('.jpg', frame, enc)
+                            with _cam_locks[slot]: _cam_jpegs[slot] = out.tobytes()
+                            fc += 1
+                            now = time.time()
+                            if now - ft >= 1.0:
+                                with _cam_fps_lock: _cam_fps_v[slot] = fc / (now - ft)
+                                fc, ft = 0, now
+            except Exception as e:
+                print(f"[Camera{slot}] URL 읽기 오류: {e}, 3s 후 재시도")
+            time.sleep(3)
+        return  # URL 모드에서는 여기까지만
+
+    # ── RealSense SDK 직접 접근 ───────────────────────────────────────────────
     pipeline = None
+    try:
+        import pyrealsense2 as rs, numpy as np
+        ctx = rs.context()
+        if len(ctx.query_devices()) == 0:
+            raise RuntimeError("RealSense 장치 없음")
+        cfg = rs.config()
+        if serial:
+            cfg.enable_device(serial)
+        cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+        pipeline = rs.pipeline()
+        pipeline.start(cfg)
+        print(f"[Camera{slot}] RealSense 워밍업 중 (serial={serial or 'auto'})...")
+        for _ in range(10):
+            try: pipeline.wait_for_frames(timeout_ms=300)
+            except: pass
+        _cam_infos[slot]["source"] = f"RealSense:{serial}" if serial else "RealSense"
+        print(f"[Camera{slot}] RealSense SDK 연결 성공 — {label}")
+    except Exception as e:
+        print(f"[Camera{slot}] pyrealsense2 skip({e}), ffmpeg로 진행")
+        pipeline = None
 
-    # ── RealSense SDK 시도 (slot 0, pyrealsense2 설치된 경우) ──────────────────
-    if slot == 0:
-        try:
-            import pyrealsense2 as rs, numpy as np
-            ctx = rs.context()
-            rs_devs = ctx.query_devices()
-            if len(rs_devs) == 0:
-                raise RuntimeError("RealSense 장치 없음")
-            cfg = rs.config()
-            cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-            pipeline = rs.pipeline()
-            pipeline.start(cfg)
-            print(f"[Camera{slot}] RealSense 파이프라인 워밍업 중...")
-            for _ in range(10):
-                try: pipeline.wait_for_frames(timeout_ms=300)
-                except: pass
-            _cam_infos[slot]["source"] = "RealSense"
-            print(f"[Camera{slot}] RealSense SDK 연결 성공 — {label}")
-        except Exception as e:
-            print(f"[Camera{slot}] pyrealsense2 skip({e}), ffmpeg로 진행")
-            pipeline = None
-
-    # ── ffmpeg subprocess로 v4l2 캡처 ────────────────────────────────────────
+    # ── ffmpeg v4l2 폴백 ──────────────────────────────────────────────────────
     import subprocess, numpy as np
     proc = None
     W, H = 640, 480
@@ -126,8 +173,6 @@ def _camera_worker(camera_id: int = 0, slot: int = 0) -> None:
                 ]
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL, bufsize=frame_bytes*2)
-                # 첫 프레임 수신 확인 (최대 3초)
-                proc.stdout._timeout = None
                 raw = proc.stdout.read(frame_bytes)
                 if len(raw) == frame_bytes:
                     _cam_infos[slot]["source"] = f"webcam:{camera_id}"
@@ -153,7 +198,7 @@ def _camera_worker(camera_id: int = 0, slot: int = 0) -> None:
                 raw = proc.stdout.read(frame_bytes)
                 if len(raw) == frame_bytes:
                     frame = np.frombuffer(raw, dtype=np.uint8).reshape(H, W, 3)
-                else:          # 프로세스 죽음 → 재시작 필요
+                else:
                     proc.kill(); proc = None; time.sleep(1)
         except Exception: pass
         if frame is not None:
@@ -167,7 +212,6 @@ def _camera_worker(camera_id: int = 0, slot: int = 0) -> None:
                     fc, ft = 0, now
             except Exception: pass
         elif proc is None and pipeline is None:
-            # ffmpeg 재시작
             time.sleep(3)
             try:
                 proc = subprocess.Popen(
@@ -268,11 +312,11 @@ body{background:var(--bg);color:var(--t1);font-family:var(--font);
 .sy::before{background:var(--yellow)}.sr::before{background:var(--red)}
 .sc2::before{background:var(--cyan)}.sp::before{background:var(--purple)}
 .ss::before{background:var(--slate)}
-.sc-lbl{font-size:10px;font-weight:700;color:var(--t2);text-transform:uppercase;
+.sc-lbl{font-size:11px;font-weight:700;color:var(--t2);text-transform:uppercase;
   letter-spacing:.3px;margin-bottom:2px}
-.sc-val{font-family:var(--mono);font-size:18px;font-weight:800;line-height:1;
+.sc-val{font-family:var(--mono);font-size:21px;font-weight:800;line-height:1;
   font-variant-numeric:tabular-nums;transition:color .3s}
-.sc-unit{font-size:10px;font-weight:600;margin-left:2px;font-family:var(--font);color:var(--t3)}
+.sc-unit{font-size:11px;font-weight:600;margin-left:2px;font-family:var(--font);color:var(--t3)}
 .sg .sc-val{color:var(--green)}.sb .sc-val{color:var(--blue)}
 .sy .sc-val{color:var(--yellow)}.sc2 .sc-val{color:var(--cyan)}
 .sp .sc-val{color:var(--purple)}.ss .sc-val{color:var(--slate)}
@@ -620,6 +664,43 @@ body{background:var(--bg);color:var(--t1);font-family:var(--font);
 .teleop-st{font-size:9px;text-align:center;font-family:var(--mono);
   padding:2px 0;min-height:14px;color:var(--t3);transition:color .2s}
 
+/* 데이터 수집 패널 */
+.rec-sep{height:2px;background:linear-gradient(90deg,var(--red),var(--purple));border-radius:1px;margin:6px 10px 5px;opacity:.35}
+.rec-section{padding:0 10px 10px}
+.rec-status-badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:10px;
+  font-size:9px;font-weight:700;letter-spacing:.5px;margin-bottom:6px;border:1px solid var(--border);
+  background:var(--green-bg);border-color:#86efac;color:var(--green-tx);transition:all .3s}
+.rec-status-badge.recording{background:var(--red-bg);border-color:#fca5a5;color:var(--red-tx)}
+.rec-status-badge.starting{background:var(--yellow-bg);border-color:#fde68a;color:var(--yellow-tx)}
+.rec-status-badge.stopping{background:var(--cyan-bg);border-color:#a5f3fc;color:var(--cyan-tx)}
+.rec-dot{width:5px;height:5px;border-radius:50%;background:currentColor}
+.rec-dot.blink{animation:blink .7s infinite}
+.rec-inp-row{display:flex;flex-direction:column;gap:3px;margin-bottom:5px}
+.rec-inp-lbl{font-size:8px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.4px}
+.rec-inp{width:100%;padding:3px 5px;border:1px solid var(--border);border-radius:4px;
+  font-family:var(--mono);font-size:10px;background:var(--bg);outline:none;color:var(--t1)}
+.rec-inp:focus{border-color:var(--red);background:var(--red-bg)}
+.rec-btns{display:grid;grid-template-columns:1fr 1fr;gap:3px;margin-bottom:4px}
+.rec-btn{padding:5px 0;border-radius:4px;border:1px solid var(--border);
+  background:var(--bg);font-size:9.5px;font-weight:700;cursor:pointer;
+  color:var(--t2);transition:all .15s;width:100%}
+.rec-btn.start{background:var(--green);color:#fff;border-color:var(--green)}
+.rec-btn.start:hover{background:var(--green-tx)}
+.rec-btn.stop{background:var(--red);color:#fff;border-color:var(--red)}
+.rec-btn.stop:hover{background:var(--red-tx)}
+.rec-btn.home{grid-column:1/3}
+.rec-btn.convert{grid-column:1/3;background:var(--purple-bg);border-color:#ddd6fe;color:var(--purple-tx)}
+.rec-btn.convert:hover{background:var(--purple);color:#fff}
+.rec-btn:disabled{opacity:.4;cursor:not-allowed}
+.grip-btns{display:grid;grid-template-columns:1fr 1fr 1fr;gap:2px;margin-bottom:4px}
+.grip-btn{padding:4px 0;border-radius:3px;border:1px solid var(--border);
+  background:var(--bg);font-size:8.5px;font-weight:700;cursor:pointer;color:var(--t2);transition:all .1s}
+.grip-btn:active{background:var(--cyan-bg);border-color:var(--cyan);color:var(--cyan-tx)}
+.rot-btns{display:grid;grid-template-columns:repeat(4,1fr);gap:2px;margin-bottom:3px}
+.rot-btn{padding:3px 0;border-radius:3px;border:1px solid var(--border);
+  background:var(--bg);font-size:8px;font-weight:700;cursor:pointer;color:var(--t2);transition:all .1s}
+.rot-btn:active{background:var(--purple-bg);border-color:var(--purple);color:var(--purple-tx)}
+
 /* DAMAGE FLASH */
 #dmg-flash{position:fixed;inset:0;pointer-events:none;z-index:999;
   opacity:0;border:3px solid var(--red);background:rgba(220,38,38,.06)}
@@ -780,6 +861,87 @@ body{background:var(--bg);color:var(--t1);font-family:var(--font);
             <span id="tp-spd-val">20%</span>
           </div>
           <div class="teleop-st" id="teleop-st">정지</div>
+          <!-- 추가 회전 버튼 -->
+          <div style="margin-top:6px">
+            <div style="font-size:9px;color:var(--t3);margin-bottom:2px;font-weight:700">회전 각도</div>
+            <input type="range" id="rot-speed" min="1" max="20" step="1" value="5"
+              style="width:100%;height:4px;cursor:pointer"
+              oninput="document.getElementById('rot-spd-val').textContent=this.value+'°'">
+            <span id="rot-spd-val" style="font-size:8px;color:var(--t3)">5°</span>
+          </div>
+          <div class="rot-btns" style="margin-top:4px">
+            <button class="rot-btn" onclick="teleopMove('rx_plus')">Rx+</button>
+            <button class="rot-btn" onclick="teleopMove('rx_minus')">Rx-</button>
+            <button class="rot-btn" onclick="teleopMove('ry_plus')">Ry+</button>
+            <button class="rot-btn" onclick="teleopMove('ry_minus')">Ry-</button>
+            <button class="rot-btn" onclick="teleopMove('rz_plus')">Rz+</button>
+            <button class="rot-btn" onclick="teleopMove('rz_minus')">Rz-</button>
+          </div>
+        </div>
+        <!-- 데이터 수집 구분선 -->
+        <div class="rec-sep"></div>
+        <div class="rec-section">
+          <div class="sec-lbl" style="color:var(--red-tx)">데이터 수집</div>
+          <!-- 녹화 상태 -->
+          <div class="rec-status-badge" id="rec-badge">
+            <div class="rec-dot" id="rec-dot"></div>
+            <span id="rec-badge-txt">대기</span>
+          </div>
+          <!-- 메타 입력 -->
+          <div class="rec-inp-row">
+            <span class="rec-inp-lbl">에피소드 (비우면 자동)</span>
+            <input class="rec-inp" id="rec-ep" type="text" placeholder="자동 부여">
+          </div>
+          <div class="rec-inp-row">
+            <span class="rec-inp-lbl">태스크</span>
+            <input class="rec-inp" id="rec-task" type="text"
+              value="Grasp the strawberry stem and pick it.">
+          </div>
+          <div class="rec-inp-row">
+            <span class="rec-inp-lbl">카테고리</span>
+            <input class="rec-inp" id="rec-cat" type="text" placeholder="no_occlusion">
+          </div>
+          <!-- 홈 포즈 -->
+          <div class="rec-inp-row">
+            <span class="rec-inp-lbl">홈 포즈</span>
+            <select class="rec-inp" id="rec-home">
+              <option value="top_left">top_left</option>
+              <option value="top_right">top_right</option>
+              <option value="bottom_left">bottom_left</option>
+              <option value="bottom_right">bottom_right</option>
+            </select>
+          </div>
+          <!-- 데이터 저장 경로 -->
+          <div class="rec-inp-row">
+            <span class="rec-inp-lbl">데이터 경로</span>
+            <input class="rec-inp" id="rec-rawdir" type="text"
+              placeholder="/vla_ws/data/raw/final_project/vla_dataset_v0.3.0"
+              value="/vla_ws/data/raw/final_project/vla_dataset_v0.3.0"
+              style="font-size:9px;padding:4px">
+          </div>
+          <!-- 제어 버튼 -->
+          <div class="rec-btns">
+            <button class="rec-btn start" id="btn-rec-start" onclick="startRecording()">▶ 녹화 시작</button>
+            <button class="rec-btn stop"  id="btn-rec-stop"  onclick="stopRecording()" disabled>■ 녹화 종료</button>
+            <button class="rec-btn home"  onclick="moveHome()">⌂ 홈 이동</button>
+            <button class="rec-btn convert" onclick="convertData()">⚙ 데이터 변환</button>
+            <!-- 변환 진행률 바 -->
+            <div id="convert-progress-container" style="display:none;margin-top:6px">
+              <div style="font-size:9px;color:var(--t3);margin-bottom:2px;font-weight:700">변환 중...</div>
+              <div style="width:100%;height:12px;background:var(--bg);border:1px solid var(--border);border-radius:2px;overflow:hidden">
+                <div id="convert-progress-bar" style="height:100%;background:var(--purple);width:0%;transition:width 0.3s;display:flex;align-items:center;justify-content:center">
+                  <span id="convert-progress-text" style="font-size:8px;color:#fff;font-weight:700"></span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <!-- 그리퍼 -->
+          <div class="sec-lbl" style="color:var(--cyan-tx);margin-top:4px">그리퍼 즉시 제어</div>
+          <div class="grip-btns">
+            <button class="grip-btn" onclick="teleopGripper(0)">열기</button>
+            <button class="grip-btn" onclick="teleopGripper(740)">파지</button>
+            <button class="grip-btn" onclick="teleopGripper(600)">홈(600)</button>
+          </div>
         </div>
       </div>
     </div>
@@ -816,7 +978,7 @@ body{background:var(--bg);color:var(--t1);font-family:var(--font);
           <div class="jvel"><label>속도(%)</label><input type="number" id="jvel" value="10" min="1" max="100"></div>
           <div class="jbtns">
             <button class="jbtn s" onclick="loadCurAngles()">현재값</button>
-            <button class="jbtn p" onclick="sendJointCmd()">이동</button>
+            <button class="jbtn p" onclick="sendJointCmd().catch(()=>{})">이동</button>
           </div>
         </div>
         <div class="jstatus" id="jstatus"></div>
@@ -846,7 +1008,7 @@ body{background:var(--bg);color:var(--t1);font-family:var(--font);
           <div class="jvel"><label>속도(%)</label><input type="number" id="tvel" value="10" min="1" max="100"></div>
           <div class="jbtns">
             <button class="jbtn s" onclick="loadCurTcp()">현재값</button>
-            <button class="jbtn p" onclick="sendTcpCmd()">이동</button>
+            <button class="jbtn p" onclick="sendTcpCmd().catch(()=>{})">이동</button>
           </div>
         </div>
         <!-- 그리퍼 구분선 -->
@@ -913,6 +1075,10 @@ body{background:var(--bg);color:var(--t1);font-family:var(--font);
               <div class="cam-spin" id="cam-spin-0"></div>
               <div class="cam-ph-txt" id="cam-ph-txt-0">카메라 연결 없음</div>
             </div>
+            <div class="cam-ov" id="cam-ov-0">
+              <span id="cam-ov-ts"></span>
+              <span id="cam-ov-src-0"></span>
+            </div>
             <div class="cam-fs-hint">클릭: 전체화면</div>
           </div>
         </div>
@@ -975,7 +1141,7 @@ body{background:var(--bg);color:var(--t1);font-family:var(--font);
 <script>
 /* 상수 */
 const STATUS = {
-  idle:       {label:'대기 중', icon:'○', color:'var(--t3)',     ring:false},
+  idle:       {label:'대기 중', icon:'●', color:'var(--green)',  ring:false},  // 로봇 연결됨
   approaching:{label:'접근 중', icon:'→', color:'var(--cyan)',   ring:true},
   grasping:   {label:'파지 중', icon:'●', color:'var(--yellow)', ring:true},
   returning:  {label:'복귀 중', icon:'←', color:'var(--green)',  ring:true},
@@ -1140,13 +1306,15 @@ async function sendJointCmd(){
   const badge=document.getElementById('j-badge');
   const stat=document.getElementById('jstatus');
   try{
-    const r=await fetch('/api/joint-command',{method:'POST',
-      headers:{'Content-Type':'application/json'},body:JSON.stringify({angles,velocity:vel})});
+    const r=await fetch(TELEOP_API+'/move',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({command:'joint',angles,velocity:vel})});
     if(r.ok){
       badge.textContent='전송됨';
       badge.style.cssText='background:var(--green-bg);border-color:#bbf7d0;color:var(--green-tx)';
       stat.style.color='var(--green-tx)';stat.textContent='명령 전송됨';
       setTimeout(()=>{badge.textContent='대기';badge.style.cssText='';stat.textContent='';},3500);
+    }else{
+      stat.style.color='var(--red-tx)';stat.textContent='로봇 제어 오류';
     }
   }catch(e){stat.style.color='var(--red-tx)';stat.textContent='전송 실패';}
 }
@@ -1162,8 +1330,8 @@ async function sendTcpCmd(){
   const vel=parseFloat(document.getElementById('tvel').value)||10;
   const badge=document.getElementById('tg-badge');
   try{
-    const r=await fetch('/api/tcp-command',{method:'POST',
-      headers:{'Content-Type':'application/json'},body:JSON.stringify({pose,velocity:vel})});
+    const r=await fetch(TELEOP_API+'/move',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({command:'tcp',pose,velocity:vel})});
     if(r.ok){
       badge.textContent='TCP 전송';
       badge.style.cssText='background:var(--purple-bg);border-color:#ddd6fe;color:var(--purple-tx)';
@@ -1192,7 +1360,7 @@ async function sendGripCmd(pos){
   if(position<=5)state='closed';else if(position<95)state='grasping';
   const badge=document.getElementById('tg-badge');
   try{
-    const r=await fetch('/api/gripper-command',{method:'POST',
+    const r=await fetch(TELEOP_API+'/gripper',{method:'POST',
       headers:{'Content-Type':'application/json'},body:JSON.stringify({position,force,state})});
     if(r.ok){
       badge.textContent='그리퍼 전송';
@@ -1209,8 +1377,11 @@ function renderJoints(s){
   (s.joint_angles||[0,0,0,0,0,0]).forEach((a,i)=>{
     const[mn,mx]=J_LIM[i];
     const ve=document.getElementById('jv'+(i+1));
+    const ie=document.getElementById('ji'+(i+1));  // 관절 입력 필드도 함께 업데이트
     const fe=document.getElementById('jf'+(i+1));
     if(ve)ve.textContent=a.toFixed(1)+'°';
+    // 입력 필드가 포커스 중이 아닐 때만 현재 각도로 업데이트 (사용자 입력 보호)
+    if(ie && ie !== document.activeElement)ie.value=a.toFixed(1);
     if(fe){
       if(a>=0){const w=Math.min(a/mx*50,50);fe.style.left='50%';fe.style.width=w+'%';fe.style.background='var(--blue)';}
       else{const w=Math.min(Math.abs(a)/Math.abs(mn)*50,50);fe.style.left=(50-w)+'%';fe.style.width=w+'%';fe.style.background='var(--purple)';}
@@ -1237,7 +1408,11 @@ function renderGripper(s){
   const ge=document.getElementById('gjgap');if(ge)ge.style.width=((pos/100)*28).toFixed(1)+'px';
   ['gjl','gjr'].forEach(id=>{const e=document.getElementById(id);if(e)e.style.background=st.color;});
   const se=document.getElementById('g-state');if(se){se.textContent=st.label;se.style.color=st.color;}
-  const pe=document.getElementById('g-pct');if(pe)pe.textContent=pos.toFixed(0)+'% | '+(g.force??30).toFixed(0)+' N';
+  const pe=document.getElementById('g-pct');
+  if(pe){
+    const raw=(g.raw_pos!=null)?'  |  '+g.raw_pos+'/740':'';
+    pe.textContent=pos.toFixed(0)+'%'+raw+'  |  '+(g.force??30).toFixed(0)+' N';
+  }
   const sl=document.getElementById('g-slider');if(sl&&document.activeElement!==sl)sl.value=pos;
   const ip=document.getElementById('g-inp');if(ip&&document.activeElement!==ip)ip.value=pos.toFixed(0);
   const gb=document.getElementById('gr-badge');if(gb)gb.textContent=st.label;
@@ -1430,7 +1605,14 @@ function render(s){
   harvestStart=s.current_harvest_start?new Date(s.current_harvest_start):null;
 
   /* 로봇 상태 */
-  const si=STATUS[s.status||'idle']||STATUS.idle;
+  let si = STATUS.idle;  // 기본값
+  if(!s.robot_ready) {
+    // 로봇 미연결: 회색으로 표시
+    si = {label:'연결 대기', icon:'○', color:'var(--t3)', ring:false};
+  } else {
+    // 로봇 연결됨: status에 따라 표시
+    si = STATUS[s.status||'idle'] || STATUS.idle;
+  }
   document.getElementById('sp-icon').textContent=si.icon;
   document.getElementById('sp-icon').style.color=si.color;
   document.getElementById('sp-icon-bg').style.borderColor=si.color;
@@ -1486,6 +1668,150 @@ function connectWS(){
   ws.onerror=()=>ws.close();
 }
 connectWS();
+
+/* ── 텔레오퍼레이션 API (포트 8767) ────────────────────────────────────────── */
+// 대시보드와 teleop-api 모두 host 네트워크를 사용하므로 localhost로 접근 가능
+const TELEOP_API = `http://${window.location.hostname}:8767`;
+
+async function teleopMove(cmd) {
+  // 회전 명령어이면 rot-speed 값을 속도로 전달
+  let body = {command:cmd};
+  if(['rx_plus','rx_minus','ry_plus','ry_minus','rz_plus','rz_minus'].includes(cmd)) {
+    const rotSpeed = parseFloat(document.getElementById('rot-speed')?.value || 5);
+    body.angle_scale = rotSpeed / 5;  // 기본값(5°)대비 배율
+  }
+  await fetch(TELEOP_API+'/move', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(body)
+  }).catch(()=>{});
+}
+
+async function teleopGripper(pos) {
+  await fetch(TELEOP_API+'/gripper', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({position:pos})
+  }).catch(()=>{});
+}
+
+async function moveHome() {
+  const home = document.getElementById('rec-home')?.value || '';
+  await fetch(TELEOP_API+'/home', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({home_pose:home})
+  }).catch(()=>{});
+}
+
+async function startRecording() {
+  const btn = document.getElementById('btn-rec-start');
+  btn.disabled = true;  // 중복 방지
+
+  const ep   = document.getElementById('rec-ep')?.value.trim() || '';
+  const task = document.getElementById('rec-task')?.value.trim() || '';
+  const cat  = document.getElementById('rec-cat')?.value.trim() || '';
+  const raw  = document.getElementById('rec-rawdir')?.value.trim() || '';
+  const r    = await fetch(TELEOP_API+'/record/start', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({episode:ep||undefined, task, category:cat, raw_dir:raw||undefined})
+  }).catch(()=>null);
+  if(r&&r.ok){
+    const d=await r.json();
+    if(d.ok && d.episode) document.getElementById('rec-ep').value = d.episode;
+  } else {
+    btn.disabled = false;  // 실패 시 다시 활성화
+  }
+}
+
+async function stopRecording() {
+  const btn = document.getElementById('btn-rec-stop');
+  btn.disabled = true;  // 중복 방지
+
+  await fetch(TELEOP_API+'/record/stop', {method:'POST'}).catch(()=>{
+    btn.disabled = false;  // 실패 시 다시 활성화
+  });
+}
+
+async function convertData() {
+  const r = await fetch(TELEOP_API+'/convert', {method:'POST'}).catch(()=>null);
+  if(!r||!r.ok) {alert('변환 실패'); return;}
+
+  // 진행률 바 표시
+  document.getElementById('convert-progress-container').style.display = 'block';
+  let lastProgress = 0;
+
+  // 진행률 폴링 (1초마다)
+  const interval = setInterval(async ()=>{
+    const statusR = await fetch(TELEOP_API+'/status').catch(()=>null);
+    if(!statusR||!statusR.ok) return;
+    const d = await statusR.json();
+
+    const bar = document.getElementById('convert-progress-bar');
+    const text = document.getElementById('convert-progress-text');
+    const pct = Math.max(lastProgress, d.convert_progress || 0);
+    lastProgress = pct;
+
+    bar.style.width = pct + '%';
+    text.textContent = pct + '%';
+
+    console.log(`변환: ${pct}% (converting=${d.converting})`);
+
+    // 완료
+    if(!d.converting && pct >= 100) {
+      clearInterval(interval);
+      alert('✅ 데이터 변환 완료!');
+      setTimeout(()=>{
+        document.getElementById('convert-progress-container').style.display = 'none';
+        bar.style.width = '0%';
+        text.textContent = '';
+        lastProgress = 0;
+      }, 2000);
+    }
+  }, 1000);
+}
+
+/* 녹화 상태 폴링 (1 초 간격) */
+function updateRecBadge(phase, robotReady, robotError) {
+  const badge  = document.getElementById('rec-badge');
+  const dot    = document.getElementById('rec-dot');
+  const txt    = document.getElementById('rec-badge-txt');
+  const btnS   = document.getElementById('btn-rec-start');
+  const btnE   = document.getElementById('btn-rec-stop');
+  if(!badge) return;
+
+  if(!robotReady) {
+    badge.className = 'rec-status-badge';
+    dot.className   = 'rec-dot';
+    txt.textContent = robotError ? `로봇 미연결: ${robotError}` : '로봇 API 대기 중...';
+    if(btnS) btnS.disabled = true;
+    if(btnE) btnE.disabled = true;
+    return;
+  }
+
+  badge.className = 'rec-status-badge ' + (phase==='recording'?'recording':phase==='starting'?'starting':phase==='stopping'?'stopping':'');
+  dot.className   = 'rec-dot' + (phase==='recording'||phase==='starting'?' blink':'');
+  const labels = {idle:'대기', starting:'시작 중...', recording:'● 녹화 중', stopping:'종료 중...'};
+  txt.textContent = labels[phase] || phase;
+  if(btnS) btnS.disabled = (phase !== 'idle');
+  if(btnE) btnE.disabled = (phase === 'idle' || phase === 'stopping');
+}
+
+setInterval(async()=>{
+  const r = await fetch(TELEOP_API+'/status').catch(()=>null);
+  if(!r||!r.ok){updateRecBadge('idle', false, 'API 서버 미응답');return;}
+  const d = await r.json();
+  updateRecBadge(d.phase||'idle', d.robot_ready, d.robot_error);
+}, 1000);
+
+/* 기존 sendTeleop: D-pad 버튼 → 로봇 실제 이동도 호출 */
+const _origSendTeleop = sendTeleop;
+sendTeleop = async function(cmd) {
+  const sp = parseFloat(document.getElementById('tp-speed')?.value||0.2);
+  const ts = document.getElementById('teleop-st');
+  if(ts){ts.textContent=TELEOP_LBL[cmd]||cmd;
+    ts.style.color=cmd==='stop'?'var(--t3)':'var(--blue)';}
+  await fetch('/api/teleop', {method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({command:cmd, speed:sp})}).catch(()=>{});
+  if(cmd!=='stop') await teleopMove(cmd);
+};
 
 /* 듀얼 카메라 */
 const CAM_SRCS=['/camera/0','/camera/1'];
@@ -1544,16 +1870,41 @@ function camRetry(i){
   const img=document.getElementById('cam-img-'+i);
   if(img)img.src=CAM_SRCS[i]+'?'+Date.now();
 }
+/* MJPEG 스트림 대신 단일 JPEG 폴링 (브라우저 호환성 확실) */
+const CAM_SNAP=['/api/snapshot/0','/api/snapshot/1'];
 function initCam(i){
   const img=document.getElementById('cam-img-'+i);
   const spin=document.getElementById('cam-spin-'+i);
   const ptx=document.getElementById('cam-ph-txt-'+i);
   if(!img)return;
   img.onload=()=>camSetLive(i);
-  img.onerror=()=>camSetError(i);
+  img.onerror=()=>{}; // 폴링 중 일시적 204는 무시
   if(spin)spin.style.display='block';
   if(ptx)ptx.textContent='카메라 연결 중...';
-  img.src=CAM_SRCS[i]+'?'+Date.now();
+
+  let failCount=0;
+  async function poll(){
+    try{
+      const r=await fetch(CAM_SNAP[i]+'?t='+Date.now());
+      if(r.ok && r.status===200){
+        const blob=await r.blob();
+        if(blob.size>0){
+          if(img._url)URL.revokeObjectURL(img._url);
+          img._url=URL.createObjectURL(blob);
+          img.src=img._url;
+          failCount=0;
+        }
+      }else{
+        failCount++;
+        if(failCount>10)camSetError(i);
+      }
+    }catch(e){
+      failCount++;
+      if(failCount>10)camSetError(i);
+    }
+    setTimeout(poll, 100);  // ~10fps
+  }
+  poll();
 }
 [0,1].forEach(initCam);
 
@@ -1581,7 +1932,9 @@ function toggleCamFS(i){
 """
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
-def make_app(demo=False, camera_id=0, camera_id_1=-1, no_camera=False):
+def make_app(demo=False, camera_id=0, camera_id_1=-1, no_camera=False,
+             serial_cam0='', serial_cam1='',
+             camera_url_0='', camera_url_1=''):
     try:
         from fastapi import FastAPI, WebSocket, Request
         from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, Response
@@ -1591,7 +1944,13 @@ def make_app(demo=False, camera_id=0, camera_id_1=-1, no_camera=False):
     app = FastAPI()
 
     @app.get("/")
-    async def index(): return HTMLResponse(HTML)
+    async def index():
+        # 브라우저가 옛 HTML/JS를 캐싱하지 못하도록 강제
+        return HTMLResponse(HTML, headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        })
 
     @app.get("/camera-info")
     async def cam_info():
@@ -1718,10 +2077,38 @@ def make_app(demo=False, camera_id=0, camera_id_1=-1, no_camera=False):
                 await asyncio.sleep(0.4)
         except Exception: pass
 
+    # 로봇 상태 주기적 업데이트
+    def _sync_robot_status_worker():
+        import urllib.request
+        while True:
+            try:
+                import time; time.sleep(2)
+                req = urllib.request.Request('http://localhost:8767/status')
+                with urllib.request.urlopen(req, timeout=2) as resp:
+                    api_status = json.loads(resp.read())
+                    s = _load()
+                    s['robot_ready'] = api_status.get('robot_ready', False)
+                    s['robot_error'] = api_status.get('robot_error', '')
+                    if 'tcp_pose' in api_status:
+                        s['tcp_pose'] = api_status['tcp_pose']
+                    if 'joint_angles' in api_status:
+                        s['joint_angles'] = api_status['joint_angles']
+                    if 'gripper' in api_status:
+                        s['gripper'] = api_status['gripper']
+                    _save(s)
+            except Exception as e:
+                print(f'[WARN] 로봇 상태 동기화 실패: {e}')
+
+    threading.Thread(target=_sync_robot_status_worker, daemon=True).start()
+
     if not no_camera:
-        threading.Thread(target=_camera_worker, args=(camera_id, 0), daemon=True).start()
-        if camera_id_1 >= 0:
-            threading.Thread(target=_camera_worker, args=(camera_id_1, 1), daemon=True).start()
+        threading.Thread(target=_camera_worker,
+            kwargs=dict(camera_id=camera_id, slot=0, serial=serial_cam0, url=camera_url_0),
+            daemon=True).start()
+        if camera_id_1 >= 0 or camera_url_1:
+            threading.Thread(target=_camera_worker,
+                kwargs=dict(camera_id=camera_id_1, slot=1, serial=serial_cam1, url=camera_url_1),
+                daemon=True).start()
     if demo:
         threading.Thread(target=_run_demo, daemon=True).start()
     return app
@@ -1822,6 +2209,10 @@ def main():
     p.add_argument('--no-camera', action='store_true')
     p.add_argument('--camera-id',   type=int, default=int(os.environ.get('CAMERA_ID',   6)))
     p.add_argument('--camera-id-1', type=int, default=int(os.environ.get('CAMERA_ID_1', 0)))
+    p.add_argument('--serial-cam0', default=os.environ.get('REALSENSE_SERIAL_0', ''))
+    p.add_argument('--serial-cam1', default=os.environ.get('REALSENSE_SERIAL_1', ''))
+    p.add_argument('--camera-url-0', default=os.environ.get('CAMERA_URL_0', ''))
+    p.add_argument('--camera-url-1', default=os.environ.get('CAMERA_URL_1', ''))
     p.add_argument('--port',      type=int, default=8765)
     p.add_argument('--host',      default='0.0.0.0')
     p.add_argument('--update', choices=['start_harvest','harvest_success','harvest_fail','damage','reset'])
@@ -1859,7 +2250,9 @@ def main():
     try: import uvicorn
     except ImportError: print("pip install 'uvicorn[standard]'"); sys.exit(1)
     app = make_app(demo=args.demo, camera_id=args.camera_id,
-                   camera_id_1=args.camera_id_1, no_camera=args.no_camera)
+                   camera_id_1=args.camera_id_1, no_camera=args.no_camera,
+                   serial_cam0=args.serial_cam0, serial_cam1=args.serial_cam1,
+                   camera_url_0=args.camera_url_0, camera_url_1=args.camera_url_1)
     print(f"\n  딸기 수확 대시보드  →  http://localhost:{args.port}\n")
     if args.demo: print("  [데모 모드] 시뮬레이션 진행 중\n")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
